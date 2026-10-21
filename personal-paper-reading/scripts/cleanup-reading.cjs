@@ -3,7 +3,14 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
-const {marked} = require('marked');
+// Optional: cleanup also works when the HTML/Notion packages are not installed.
+let marked;
+function markdownParser() {
+  if (marked !== undefined) return marked;
+  try { marked = require('marked').marked; }
+  catch(e) { if(e.code !== 'MODULE_NOT_FOUND') throw e; marked = null; }
+  return marked;
+}
 
 const inside = (root, target) => {
   const rel = path.relative(root, target);
@@ -38,6 +45,7 @@ function walk(dir, visit) {
 }
 function references(root) {
   const refs = new Set();
+  const fallbackTexts = [];
   function add(from, value) {
     if (!value || /^(?:https?:|mailto:|data:|#)/i.test(value)) return;
     try {
@@ -50,16 +58,37 @@ function references(root) {
     if (!/\.(?:md|html|css)$/i.test(file)) return;
     const text = fs.readFileSync(file,'utf8');
     if (/\.md$/i.test(file)) {
-      // Marked treats details bodies as HTML; parse again without the folding wrappers.
-      const unfolded=text.replace(/<\/?(?:details|summary)\b[^>]*>/gi,'');
-      for (const version of new Set([text,unfolded])) marked.walkTokens(marked.lexer(version),token => {
-        if (token.type === 'image' || token.type === 'link') add(file,token.href);
-      });
+      const parser=markdownParser();
+      if (parser) {
+        // Marked treats details bodies as HTML; parse again without the folding wrappers.
+        const unfolded=text.replace(/<\/?(?:details|summary)\b[^>]*>/gi,'');
+        for (const version of new Set([text,unfolded])) parser.walkTokens(parser.lexer(version),token => {
+          if (token.type === 'image' || token.type === 'link') add(file,token.href);
+        });
+      } else {
+        // A conservative fallback may retain extra files, but needs no npm install.
+        let decoded=text.replace(/\\([\s\S])/g,'$1');
+        decoded=decoded.replace(/(?:%[0-9a-f]{2})+/gi,value=>{try{return decodeURIComponent(value);}catch{return value;}});
+        fallbackTexts.push(decoded);
+        // Collect inline and reference-definition destinations, including directory links.
+        for (const match of decoded.matchAll(/(?:\]\(|^\s{0,3}\[[^\]\n]+\]:\s*)([^\n]+)/gm)) {
+          const value=match[1].trim();
+          if(value.startsWith('<')) add(file,value.slice(1,value.indexOf('>')));
+          else {
+            add(file,value);
+            for(let i=0;i<value.length;i++) if(/[)\s]/.test(value[i])) add(file,value.slice(0,i));
+          }
+        }
+      }
     }
     for (const m of text.matchAll(/\b(?:src|href)\s*=\s*["']([^"']+)["']/gi)) add(file,m[1]);
     for (const m of text.matchAll(/url\(\s*["']?([^\s)'";]+)["']?\s*\)/gi)) add(file,m[1]);
   });
-  return refs;
+  return {refs,fallbackTexts};
+}
+function referenced({refs,fallbackTexts},file) {
+  return [...refs].some(ref => same(ref,file) || inside(ref,file)) ||
+    fallbackTexts.some(text=>text.includes(path.basename(file)));
 }
 function processAlive(pid) {
   try { process.kill(pid,0); return true; }
@@ -80,7 +109,7 @@ function buildCleanupPlan(rootInput,{extracted=[],skillDir=path.resolve(__dirnam
     if (seen.has(file)) return;
     seen.add(file);
     if (!safePath(root,file)) {skipped.push({path:file,reason:'链接或越界路径'});return;}
-    if ([...refs].some(ref => same(ref,file) || inside(ref,file))) {skipped.push({path:file,reason:'被 Markdown/HTML/CSS 引用'});return;}
+    if (referenced(refs,file)) {skipped.push({path:file,reason:'被 Markdown/HTML/CSS 引用'});return;}
     const stat = fs.lstatSync(file);
     if (!stat.isFile() || stat.nlink > 1) {skipped.push({path:file,reason:'非普通文件或硬链接'});return;}
     candidates.push({path:file,reason,bytes:stat.size,mtimeMs:stat.mtimeMs,ino:stat.ino,dev:stat.dev});
@@ -94,9 +123,12 @@ function buildCleanupPlan(rootInput,{extracted=[],skillDir=path.resolve(__dirnam
     if (typeof meta.source_pdf !== 'string' || !/\.pdf$/i.test(meta.source_pdf) || !Number.isInteger(meta.page_count) || meta.page_count < 1 || !Array.isArray(meta.rendered_pages) || !meta.rendered_pages.every(n=>Number.isInteger(n)&&n>=1&&n<=meta.page_count)) throw new Error('source.json 不是有效的 PDF 提取记录。');
     const text = path.join(dir,'paper-text.txt');
     if (safePath(root,text) && fs.readFileSync(text,'utf8').startsWith('=== PDF page 1 ===')) add(text,'可重新提取的 PDF 文本');
-    for (const n of meta.rendered_pages) {
-      const image = path.join(dir,`page-${String(n).padStart(3,'0')}${meta.crop_top_left_points ? '-clip' : ''}.png`);
-      if (fs.existsSync(image)) add(image,'已指定提取目录中的页图/裁剪中间件');
+    // Older --force runs can replace the manifest while leaving earlier page PNGs.
+    // Scan ONLY direct files in the explicitly selected extraction directory.
+    for (const entry of fs.readdirSync(dir,{withFileTypes:true})) {
+      const match=/^page-(\d+)(?:-clip(?:-[A-Za-z0-9][A-Za-z0-9_-]{0,63})?)?\.png$/.exec(entry.name);
+      if (entry.isFile() && match && Number(match[1])>=1 && Number(match[1])<=meta.page_count)
+        add(path.join(dir,entry.name),'已指定提取目录中的页图/裁剪中间件');
     }
   }
   const scripts = path.join(path.resolve(skillDir),'scripts');
@@ -115,7 +147,7 @@ function applyCleanup(plan) {
   for (const entry of plan.candidates) {
     const file = entry.path;
     if (!safePath(root,file)) {skipped.push({path:file,reason:'路径已消失或变为链接'});continue;}
-    if ([...refs].some(ref => same(ref,file) || inside(ref,file))) {skipped.push({path:file,reason:'文件被新加入的正文引用'});continue;}
+    if (referenced(refs,file)) {skipped.push({path:file,reason:'文件被新加入的正文引用'});continue;}
     const stat = fs.lstatSync(file);
     if (!stat.isFile() || stat.nlink > 1 || stat.size !== entry.bytes || stat.mtimeMs !== entry.mtimeMs || stat.ino !== entry.ino || stat.dev !== entry.dev) {skipped.push({path:file,reason:'预览后文件发生变化'});continue;}
     if (/\.notion-upload\.json\.\d+\.tmp$/.test(file) && !receiptTempSafe(file,Date.now())) {skipped.push({path:file,reason:'上传状态已变化'});continue;}

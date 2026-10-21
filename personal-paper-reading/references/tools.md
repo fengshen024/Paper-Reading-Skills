@@ -4,17 +4,59 @@
 
 ## PDF 文本、页面与裁剪
 
-Python 依赖见 `requirements-pdf.txt`。当前环境已有可用库时直接使用，不为普通笔记安装无关重型模型。
+Python 依赖见 `requirements-pdf.txt`。当前环境已有可用库时直接使用；只在首次确实缺依赖时安装，不为每次裁剪重复探测或安装。
 
 ```powershell
-python -m pip install -r requirements-pdf.txt
+# 仅缺依赖时运行：python -m pip install -r requirements-pdf.txt
+# 首轮提取一次全文，并批量渲染需要定位插图的页。
 python scripts/extract-paper.py paper.pdf work/paper --pages 1,3-5
-python scripts/extract-paper.py paper.pdf work/crop --pages 3 --clip 50 80 560 400
+# 后续追加单张裁剪，不再次抽全文。
+python scripts/extract-paper.py paper.pdf work/paper --append --no-text --pages 3 --clip 50 80 560 400
 ```
 
-输出 `paper-text.txt`、带 PDF 页码和提取范围的 `source.json`，以及所选页的 PNG。文本始终提取整个 PDF；`--pages` 只控制哪些页渲染。页码从 1 开始，裁剪坐标是从页左上角计的 PDF 点，默认每点 2 像素。
+默认输出 `paper-text.txt`、带 PDF 页码和提取范围的 `source.json`，以及所选页的 PNG。首次文本抽取覆盖整个 PDF；`--pages` 控制渲染页，`--no-text` 完全跳过文本抽取及其 pypdf 依赖。页码从 1 开始，裁剪坐标是从页左上角计的 PDF 点，默认每点 2 像素，scale 合法范围为大于 0 且不超过 4。
 
-只在已查看页面并确定范围后使用 `--clip`，然后实际查看输出，确认图例与图注完整。工具不自动识别图表、不执行 OCR，也不能保证文字顺序或公式准确；扫描 PDF 需另行 OCR。默认拒绝覆盖已有输出，明确需要重建时加 `--force`。
+### 先整页定位，再批量裁剪
+
+一次查看每个目标整页，记录该页所有目标图的范围，包含图例、坐标和必要图注。`source.json` 的 `page_sizes_points` 给出实际页宽高；原始 PNG 像素坐标除以 scale 才是 PDF 点，阅读器缩放后的显示坐标不能直接使用。
+
+把范围写入 UTF-8 JSON（例如 `work/clips.json`）：
+
+```json
+[
+  {"page": 3, "box": [50, 80, 560, 400], "name": "fig2"},
+  {"page": 3, "box": [50, 420, 560, 700], "name": "fig3"}
+]
+```
+
+```powershell
+python scripts/extract-paper.py paper.pdf work/paper --append --no-text --clips work/clips.json
+```
+
+上述坐标仅作格式示例，须按实际页替换。一条命令可跨页批量裁剪，同页多个 bbox 只渲染一次。输出为 `page-003-clip-fig2.png` 等；`name` 可省略，默认按条目序号命名，显式名称限 1–64 位英文字母、数字、下划线和连字符，同页不能重名。所有 bbox、页码和输出冲突在写文件前检查。之后同一轮检查这批图，仅重裁有问题的图，不逐图试坐标。
+
+`--append` 合并 `rendered_pages` 和逐图 `renders`（文件、页码、bbox、scale），已有全文文本保持不变；没有旧文本且未指定 `--no-text` 时才抽取。已有图片仍拒绝覆盖，需要重裁同名图时显式加 `--force`；同时使用 `--append --force` 且不加 `--no-text` 会重建全文。追加时核对 PDF 路径及已记录的文件大小／修改时间，避免混入另一份或修改后的论文。旧版来源记录可追加，但没有历史逐图 bbox 的文件不会被臆造记录。
+
+只需图片时可直接 `--no-text --pages ...` 或 `--no-text --clips ...` 开始，之后同样使用 `--append`。每篇论文复用一个提取目录和来源记录，最终选中的图复制到笔记 `.assets/`。
+
+工具不自动识别图表、不执行 OCR，也不能保证文字顺序或公式准确；扫描 PDF 需另行 OCR。全文过长时在本地按 `=== PDF page N ===` 定位、分段读取，避免将整篇文本反复送入截断的工具输出。
+
+### Windows 环境
+
+PowerShell／终端的默认编码随版本和配置变化，不能统一视为 GBK。遇到 Python 中文输出乱码或编码错误时，在当前会话设置标准输入输出为 UTF-8：
+
+```powershell
+$env:PYTHONIOENCODING = 'utf-8'
+$env:PYTHONUTF8 = '1'
+```
+
+这不会改变 PowerShell 自身的文件编码；写 JSON 时明确使用 UTF-8（脚本也接受 UTF-8 BOM）。不要为验图尺寸临时尝试 `System.Drawing`；已有 Pillow 时直接：
+
+```powershell
+python -c "from PIL import Image; im=Image.open('work/paper/page-003.png'); print(im.size); im.close()"
+```
+
+尺寸检查不能替代对裁图内容的视觉核对。
 
 ## 可选离线 HTML
 
@@ -57,7 +99,7 @@ node scripts/upload-to-notion.cjs ../notes/paper.md --env-file PATH/TO/notion.en
 
 ## 完成后的清理
 
-`scripts/cleanup-reading.cjs` 不访问 Notion。明确指定工作区 `--root`，默认只预览；加 `--apply` 才删除。只有本次阅读已完成、输出已核对后才应用清理。
+`scripts/cleanup-reading.cjs` 不访问 Notion，无需先执行 `npm ci`。已安装时懒加载 `marked` 检查 Markdown 引用；未安装时保守扫描链接和文件名，可能多保留文件。明确指定工作区 `--root`，默认只预览；加 `--apply` 才删除。只有本次阅读已完成、输出已核对后才应用清理。
 
 ```powershell
 # 从 skill 目录运行，--extracted 路径相对于 --root；可重复指定。
@@ -68,7 +110,7 @@ node scripts/cleanup-reading.cjs --root .. --extracted work/paper --apply
 可清理的范围：
 
 - 本 skill 的 `scripts/__pycache__` 中 `.pyc` 字节码缓存。
-- 明确指定且具有有效 `source.json` 的 PDF 提取目录：`paper-text.txt`、来源记录列出的 `page-NNN.png`/`page-NNN-clip.png`。裁剪子目录需要分别指定；仍被 Markdown/HTML/CSS 引用的文件会保留。
+- 明确指定且具有有效 `source.json` 的 PDF 提取目录：`paper-text.txt`、目录直属的 `page-NNN.png`、`page-NNN-clip.png` 和 `page-NNN-clip-NAME.png`，页码须在 PDF 范围内。即使旧来源记录遗漏页图也可清理；自定义其他文件名不匹配。裁剪子目录需要分别指定；仍被 Markdown/HTML/CSS 引用的文件会保留。
 - 上传成功后遗留、超过 24 小时、对应进程已退出且没有上传锁的回执 `.tmp`。失败记录、活跃锁和正式回执保留。
 
 保留 `source.json` 供追溯；笔记、离线 HTML、PDF、配套 `.assets`、`assets/notion.env`、测试报告、预览计划、依赖及脚本均不清理。额外文件、预览后修改的文件或新增引用的文件不会因后缀相同被批量删除。来源文件及指定目录全部验证后才开始清理；符号链接/junction 和越界路径不删除，也不递归删除目录。脚本输出路径、数量和回收字节数，不读取或输出 token。

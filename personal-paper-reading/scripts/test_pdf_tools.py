@@ -1,10 +1,15 @@
 """Behavior tests for text provenance, crop geometry and output preservation."""
 from pathlib import Path
+import argparse
+import contextlib
+import importlib.util
+import io
 import json
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from pypdf import PdfWriter
 from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
@@ -12,6 +17,9 @@ from PIL import Image
 
 
 SCRIPT = Path(__file__).with_name('extract-paper.py')
+SPEC = importlib.util.spec_from_file_location('extract_paper', SCRIPT)
+TOOL = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(TOOL)
 
 
 class PdfToolsTests(unittest.TestCase):
@@ -75,6 +83,97 @@ class PdfToolsTests(unittest.TestCase):
         target.write_text('User edited text', encoding='utf-8')
         self.assertNotEqual(self.run_tool(output).returncode, 0)
         self.assertEqual(target.read_text(encoding='utf-8'), 'User edited text')
+
+    def test_append_preserves_text_and_accumulates_pages_and_named_crops(self):
+        output = self.root / 'append'
+        self.assertEqual(self.run_tool(output, '--pages', '1').returncode, 0)
+        text_file = output / 'paper-text.txt'
+        text_file.write_text('User edited text', encoding='utf-8')
+        before = text_file.stat().st_mtime_ns
+        crops = self.root / 'crops.json'
+        crops.write_text(json.dumps([
+            {'page': 1, 'box': [20, 40, 120, 100], 'name': 'fig1'},
+            {'page': 1, 'box': [150, 200, 250, 300], 'name': 'fig2'},
+        ]), encoding='utf-8')
+        result = self.run_tool(output, '--append', '--no-text', '--pages', '2', '--clips', str(crops), '--scale', '1')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(text_file.read_text(encoding='utf-8'), 'User edited text')
+        self.assertEqual(text_file.stat().st_mtime_ns, before)
+        meta = json.loads((output / 'source.json').read_text(encoding='utf-8'))
+        self.assertEqual(meta['rendered_pages'], [1, 2])
+        self.assertEqual(len(meta['renders']), 4)
+        self.assertEqual(meta['page_sizes_points']['1'], [300, 400])
+        with Image.open(output / 'page-001-clip-fig1.png') as image:
+            self.assertEqual(image.size, (100, 60))
+            self.assertLess(image.convert('L').getextrema()[0], 100)
+        with Image.open(output / 'page-001-clip-fig2.png') as image:
+            self.assertEqual(image.convert('L').getextrema(), (255, 255))
+        self.assertNotEqual(self.run_tool(output, '--append', '--no-text', '--clips', str(crops)).returncode, 0)
+        result = self.run_tool(output, '--append', '--no-text', '--force', '--clips', str(crops), '--scale', '2')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        meta = json.loads((output / 'source.json').read_text(encoding='utf-8'))
+        self.assertEqual(len(meta['renders']), 4, 'Replacement updates records rather than duplicating them.')
+        with Image.open(output / 'page-001-clip-fig1.png') as image:
+            self.assertEqual(image.size, (200, 120))
+        self.assertEqual(len(list(output.glob('*.txt'))), 1)
+        # --append alone also avoids re-extraction when text already exists.
+        self.assertEqual(self.run_tool(output, '--append', '--pages', '2', '--clip', '0', '0', '100', '100').returncode, 0)
+        self.assertEqual(text_file.read_text(encoding='utf-8'), 'User edited text')
+
+    def test_render_only_does_not_import_pypdf_and_renders_shared_page_once(self):
+        import pypdfium2 as pdfium
+        crops = self.root / 'batch.json'
+        crops.write_text(json.dumps([
+            {'page': 1, 'box': [20, 40, 120, 100], 'name': 'one'},
+            {'page': 1, 'box': [150, 200, 250, 300], 'name': 'two'},
+        ]), encoding='utf-8')
+        output = self.root / 'render-only'
+        args = argparse.Namespace(pdf=str(self.pdf), output=str(output), pages=None, clip=None,
+                                  clips=str(crops), scale=2, append=False, no_text=True, force=False)
+        original_render = pdfium.PdfPage.render
+        with patch.dict(sys.modules, {'pypdf': None}), patch.object(pdfium.PdfPage, 'render', autospec=True, side_effect=original_render) as render, contextlib.redirect_stdout(io.StringIO()):
+            TOOL.extract(args)
+        self.assertEqual(render.call_count, 1)
+        self.assertFalse((output / 'paper-text.txt').exists())
+        self.assertEqual(len(list(output.glob('*.png'))), 2)
+
+    def test_invalid_batch_writes_nothing_even_when_first_crop_is_valid(self):
+        for label, bad in [
+            ('outside', {'page': 2, 'box': [0, 0, 301, 100], 'name': 'bad'}),
+            ('traversal', {'page': 1, 'box': [0, 0, 100, 100], 'name': '../bad'}),
+            ('duplicate', {'page': 1, 'box': [0, 0, 100, 100], 'name': 'good'}),
+            ('tiny', {'page': 1, 'box': [0, 0, 0.01, 0.01], 'name': 'tiny'}),
+        ]:
+            with self.subTest(label=label):
+                crops = self.root / (label + '.json')
+                crops.write_text(json.dumps([{'page': 1, 'box': [0, 0, 100, 100], 'name': 'good'}, bad]), encoding='utf-8')
+                output = self.root / label
+                self.assertNotEqual(self.run_tool(output, '--clips', str(crops)).returncode, 0)
+                self.assertFalse(output.exists())
+
+    def test_append_rejects_different_or_modified_source_before_writing(self):
+        output = self.root / 'source-check'
+        self.assertEqual(self.run_tool(output, '--pages', '1').returncode, 0)
+        manifest = output / 'source.json'
+        before = manifest.read_bytes()
+        meta = json.loads(before)
+        meta['source_pdf'] = str(self.root / 'other.pdf')
+        manifest.write_text(json.dumps(meta), encoding='utf-8')
+        self.assertNotEqual(self.run_tool(output, '--append', '--no-text', '--pages', '2').returncode, 0)
+        self.assertFalse((output / 'page-002.png').exists())
+        manifest.write_bytes(before)
+        self.pdf.write_bytes(self.pdf.read_bytes() + b'\n% modified\n')
+        self.assertNotEqual(self.run_tool(output, '--append', '--no-text', '--pages', '2').returncode, 0)
+        self.assertEqual(manifest.read_bytes(), before)
+
+    def test_legacy_manifest_can_be_extended_without_reextracting(self):
+        output = self.root / 'legacy'
+        output.mkdir()
+        (output / 'source.json').write_text(json.dumps({'source_pdf': str(self.pdf), 'page_count': 2, 'rendered_pages': [1]}), encoding='utf-8')
+        (output / 'paper-text.txt').write_text('old text', encoding='utf-8')
+        result = self.run_tool(output, '--append', '--no-text', '--pages', '2')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads((output / 'source.json').read_text(encoding='utf-8'))['rendered_pages'], [1, 2])
 
 
 if __name__ == '__main__':

@@ -3,6 +3,7 @@ const assert=require('node:assert/strict');
 const fs=require('node:fs');
 const path=require('node:path');
 const os=require('node:os');
+const {spawnSync}=require('node:child_process');
 const {buildCleanupPlan,applyCleanup,main}=require('./cleanup-reading.cjs');
 
 function fixture(t){
@@ -117,4 +118,38 @@ test('CLI defaults to preview, requires an explicit workspace and rejects confli
  main(['--root',root]);assert.equal(output[0].mode,'dry-run');
  assert.throws(()=>main([]),/--root/);
  assert.throws(()=>main(['--root',root,'--apply','--dry-run']),/不能同时/);
+});
+
+test('stale manifests do not hide generated full pages or named batch crops',t=>{
+ const {root,write,options,extraction}=fixture(t);
+ write(extraction+'/source.json',JSON.stringify({source_pdf:'source.pdf',page_count:2,rendered_pages:[2],crop_top_left_points:[0,0,100,100]}));
+ const generated=['page-001-clip.png','page-001-clip-fig1.png','page-002-clip-fig2.png'];
+ const kept=['page-003.png','page-001-custom.png','draft.png','subdir/page-001.png'];
+ generated.concat(kept).forEach(file=>write(extraction+'/'+file,'png'));
+ const result=applyCleanup(buildCleanupPlan(root,options));
+ assert.equal(result.removed.length,7);
+ generated.concat(['page-001.png','page-002.png']).forEach(file=>assert.ok(!fs.existsSync(path.join(root,extraction,file))));
+ kept.concat(['source.json']).forEach(file=>assert.ok(fs.existsSync(path.join(root,extraction,file))));
+});
+
+test('cleanup without npm dependencies preserves Markdown references and still removes unreferenced pages',t=>{
+ const {root,write,extraction}=fixture(t);
+ const standalone=write('standalone/cleanup-reading.cjs',fs.readFileSync(path.join(__dirname,'cleanup-reading.cjs'),'utf8'));
+ write(extraction+'/page-002-clip-detail.png','detail');
+ write(extraction+'/page-002-clip-unused.png','unused');
+ write('notes/paper.md',`<details>\n![图][fig]\n\n[fig]: <../${extraction}/page-001.png>\n</details>\n\n![细节](<../${encodeURI(extraction)}/page-002-clip-detail.png>)`);
+ // Force the optional parser to be unavailable, regardless of global installations.
+ const loader="const M=require('node:module'),load=M._load;M._load=function(id,...rest){if(id==='marked'){const e=new Error('not installed');e.code='MODULE_NOT_FOUND';throw e;}return load.call(this,id,...rest)};require(process.argv[1]).main(process.argv.slice(2));";
+ const result=spawnSync(process.execPath,['-e',loader,standalone,'--root',root,'--extracted',extraction,'--apply'],{encoding:'utf8'});
+ assert.equal(result.status,0,result.stderr);
+ const report=JSON.parse(result.stdout);
+ assert.ok(report.removed.some(c=>c.path.endsWith('page-002.png')));
+ assert.ok(!fs.existsSync(path.join(root,extraction,'page-002-clip-unused.png')));
+ for(const file of ['page-001.png','page-002-clip-detail.png']) assert.ok(fs.existsSync(path.join(root,extraction,file)));
+ // A folder link protects all of its contents, including normalized .. segments.
+ write('notes/folder.md',`[原始图](<../work/../${extraction}>)`);
+ write(extraction+'/page-002.png','restored');
+ const again=spawnSync(process.execPath,['-e',loader,standalone,'--root',root,'--extracted',extraction,'--apply'],{encoding:'utf8'});
+ assert.equal(again.status,0,again.stderr);
+ assert.ok(fs.existsSync(path.join(root,extraction,'page-002.png')));
 });
