@@ -1,0 +1,14 @@
+{
+  "name": "personal-paper-reading",
+  "private": true,
+  "type": "commonjs",
+  "engines": { "node": ">=22.12" },
+  "scripts": {
+    "test": "node --test scripts/test-render-reading.cjs scripts/test-upload-to-notion.cjs scripts/test-cleanup-reading.cjs",
+    "build:example": "node scripts/render-reading.cjs examples/reading-demo.md examples/reading-demo.html"
+  },
+  "dependencies": {
+    "katex": "0.16.22",
+    "marked": "17.0.5"
+  }
+}

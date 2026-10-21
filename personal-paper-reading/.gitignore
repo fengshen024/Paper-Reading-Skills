@@ -1,0 +1,10 @@
+node_modules/
+__pycache__/
+*.pyc
+.env
+.env.*
+!.env.example
+notion.env
+*.notion-upload.json
+*.notion-upload.json.lock
+*.notion-upload.json.*.tmp

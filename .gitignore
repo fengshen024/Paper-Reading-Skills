@@ -1,0 +1,30 @@
+# Publish only the active skill and its repository documentation.
+# Personal notes, spreadsheets, PDFs, reports and old archives at the root stay local.
+/*
+!/.gitignore
+!/.gitattributes
+!/README.md
+!/THIRD_PARTY.md
+!/personal-paper-reading/
+
+# Credentials: keep only explicit example files.
+**/.env
+**/.env.*
+**/*.env
+!**/.env.example
+!**/*.env.example
+**/*credentials*.json
+**/*.pem
+**/*.key
+
+# Runtime dependencies and intermediate state.
+**/node_modules/
+**/__pycache__/
+**/*.py[cod]
+**/.paper-reading-tmp/
+**/*.notion-upload.json
+**/*.notion-upload.json.lock
+**/*.notion-upload.json.*.tmp
+**/*.zip
+**/.DS_Store
+**/Thumbs.db
